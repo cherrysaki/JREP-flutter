@@ -90,6 +90,8 @@ class FirestoreViewModel extends ChangeNotifier {
         if (change.type != DocumentChangeType.added) continue;
         final record = FocusFlag.fromDoc(change.doc);
         if (record == null) continue;
+        // 他の被験者のデータには反応しない（インデックス不要のためクライアント側で絞り込む）
+        if (record.subjectId != subjectId) continue;
 
         latestIsFocused = record.isFocused;
         latestTimestamp = record.timestamp;
@@ -105,6 +107,27 @@ class FirestoreViewModel extends ChangeNotifier {
     }, onError: (error) {
       debugPrint('Firestore error: $error');
     });
+  }
+
+  /// カメラモニタの集中判定を focusFlag に保存する。
+  /// ドキュメントID・フィールドは Cloud Function importFromSheet と同じ形式。
+  static Future<void> saveFocusFlag({
+    required String subjectId,
+    required bool isFocused,
+    required DateTime timestamp,
+  }) async {
+    final iso = timestamp.toUtc().toIso8601String();
+    final docId = '${subjectId.replaceAll('/', '_')}_FocusStatus_$iso';
+    await FirebaseFirestore.instance.collection('focusFlag').doc(docId).set(
+      {
+        'subjectId': subjectId,
+        'source': 'FocusStatus',
+        'isFocused': isFocused,
+        'timestamp': Timestamp.fromDate(timestamp),
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+      SetOptions(merge: true),
+    );
   }
 
   void stopListening() {
