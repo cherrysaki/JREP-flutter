@@ -4,12 +4,14 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 
 import '../app_prefs.dart';
+import '../monitor/camera_monitor.dart';
 import '../record_model.dart';
 import 'after_work_survey_view.dart';
 import 'widgets.dart';
 
 /// 作業中画面（Swift: DisplayRecordView）
 /// 経過時間の表示・90分で自動遷移・Firestore の集中度低下アラート
+/// Web ではこの画面に入るとカメラの集中モニターが自動で起動する
 class DisplayRecordView extends StatefulWidget {
   final SessionContext session;
   const DisplayRecordView({super.key, required this.session});
@@ -28,6 +30,8 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
 
   bool _hasAutoNavigated = false;
   bool _alertShown = false;
+  bool _dialogOpen = false;
+  bool _monitorActive = false;
 
   // 最大作業時間（秒）90分
   static const _maxWorkSeconds = 5400;
@@ -51,6 +55,7 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
     // Firestore リアルタイム監視開始
     _vm.addListener(_onFirestoreUpdate);
     _vm.startListening(subjectId: AppPrefs.subjectId, since: _appearDate);
+    _startMonitor();
 
     // タイマー開始
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -63,13 +68,45 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
         _hasAutoNavigated = true;
         _timer?.cancel();
         _timer = null;
+        // 集中度低下ダイアログが開いていれば閉じてから遷移する
+        if (_dialogOpen) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
         _goToAfterWorkSurvey();
       }
     });
   }
 
+  // カメラの集中モニターを起動し、判定結果を focusFlag に書き込む
+  Future<void> _startMonitor() async {
+    if (!CameraMonitor.isSupported) return;
+    _monitorActive = true;
+    final subjectId = AppPrefs.subjectId;
+    await CameraMonitor.start(
+      subjectId: subjectId,
+      onFocusStatus: (isFocused, isFinal) {
+        FirestoreViewModel.saveFocusFlag(
+          subjectId: subjectId,
+          isFocused: isFocused,
+          timestamp: DateTime.now(),
+        ).catchError((Object e) => debugPrint('focusFlag write error: $e'));
+      },
+    );
+  }
+
+  // 作業終了時：監視を止めてから最終データを送信する（停止後のアラートを防ぐ）
+  void _stopMonitor() {
+    _timer?.cancel();
+    _timer = null;
+    _vm.stopListening();
+    if (!_monitorActive) return;
+    _monitorActive = false;
+    unawaited(CameraMonitor.stop());
+  }
+
   @override
   void dispose() {
+    _stopMonitor();
     _timer?.cancel();
     _vm.removeListener(_onFirestoreUpdate);
     _vm.dispose();
@@ -84,27 +121,40 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
     }
   }
 
-  // 集中度低下アラート（音 + ダイアログ）
+  // 集中度低下アラート（音 + ダイアログ）。休憩に進むかどうかは本人が選ぶ
   Future<void> _showFocusAlert() async {
     // アラート音を再生（iOSシステム音1005相当）
     unawaited(_audioPlayer.play(AssetSource('sounds/alert.wav')));
 
-    await showDialog<void>(
+    _dialogOpen = true;
+    final takeBreak = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: const Text('集中度が低下しています。\n休憩を取ってください。'),
+        title: const Text('集中度が低下しています'),
+        content: const Text('少し休憩しませんか？\n休憩に進むと作業後アンケートに移ります。'),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              _goToAfterWorkSurvey();
-            },
-            child: const Text('OK'),
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('作業を続ける'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('休憩する'),
           ),
         ],
       ),
     );
+    _dialogOpen = false;
+    if (!mounted || _hasAutoNavigated) return;
+
+    if (takeBreak == true) {
+      _goToAfterWorkSurvey();
+    } else {
+      // 作業継続：次に集中度が下がったら再びアラートを出す
+      _alertShown = false;
+      _vm.resetAlert();
+    }
   }
 
   Future<void> _confirmEnd() async {
@@ -123,6 +173,7 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
 
   void _goToAfterWorkSurvey() {
     if (!mounted) return;
+    _stopMonitor();
     AppPrefs.currentScreen = AppScreen.afterWorkSurvey.rawValue;
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -146,6 +197,7 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
   @override
   Widget build(BuildContext context) {
     final secondary = Theme.of(context).colorScheme.onSurfaceVariant;
+    final withCamera = CameraMonitor.isSupported;
 
     return PopScope(
       canPop: false,
@@ -159,13 +211,15 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
           child: SafeArea(
             child: Column(
               children: [
-                const SizedBox(height: 20),
-                Text('作業中',
-                    style: Theme.of(context)
-                        .textTheme
-                        .headlineLarge
-                        ?.copyWith(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
+                SizedBox(height: withCamera ? 8 : 20),
+                if (!withCamera) ...[
+                  Text('作業中',
+                      style: Theme.of(context)
+                          .textTheme
+                          .headlineLarge
+                          ?.copyWith(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                ],
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Text(
@@ -174,13 +228,14 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
                     style: TextStyle(color: secondary),
                   ),
                 ),
-                const SizedBox(height: 24),
+                SizedBox(height: withCamera ? 8 : 24),
                 // タイマー表示カード
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Card(
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 24),
+                      padding:
+                          EdgeInsets.symmetric(vertical: withCamera ? 10 : 24),
                       child: SizedBox(
                         width: double.infinity,
                         child: Column(
@@ -189,16 +244,18 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
                                 style: TextStyle(
                                     color: secondary,
                                     fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 8),
+                            SizedBox(height: withCamera ? 2 : 8),
                             Text(
                               _formatTime(_elapsed),
-                              style: const TextStyle(
-                                fontSize: 64,
+                              style: TextStyle(
+                                fontSize: withCamera ? 36 : 64,
                                 fontWeight: FontWeight.w600,
-                                fontFeatures: [FontFeature.tabularFigures()],
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures()
+                                ],
                               ),
                             ),
-                            const SizedBox(height: 8),
+                            SizedBox(height: withCamera ? 4 : 8),
                             // 進捗（90分に対する割合）
                             Padding(
                               padding:
@@ -214,15 +271,33 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 24),
-                const Text('集中状態を監視中…'),
-                const SizedBox(height: 4),
-                Text('被験者ID: ${AppPrefs.subjectId}',
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodySmall
-                        ?.copyWith(color: secondary)),
-                const Spacer(),
+                if (withCamera) ...[
+                  const SizedBox(height: 8),
+                  // カメラの集中モニター（web/monitor/monitor.js）
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: CameraMonitor.view(),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text('被験者ID: ${AppPrefs.subjectId}',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: secondary)),
+                  const SizedBox(height: 8),
+                ] else ...[
+                  const SizedBox(height: 24),
+                  const Text('集中状態を監視中…'),
+                  const SizedBox(height: 4),
+                  Text('被験者ID: ${AppPrefs.subjectId}',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: secondary)),
+                  const Spacer(),
+                ],
                 // 操作ボタン
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -245,7 +320,7 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
                         .textTheme
                         .bodySmall
                         ?.copyWith(color: secondary)),
-                const SizedBox(height: 24),
+                SizedBox(height: withCamera ? 12 : 24),
               ],
             ),
           ),
