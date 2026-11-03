@@ -130,6 +130,12 @@ class FirestoreViewModel extends ChangeNotifier {
     );
   }
 
+  /// 「作業を続ける」が選ばれたとき、次の集中度低下で再びアラートを出せるようにする
+  void resetAlert() {
+    _hasDetectedFalse = false;
+    showAlert = false;
+  }
+
   void stopListening() {
     _subscription?.cancel();
     _subscription = null;

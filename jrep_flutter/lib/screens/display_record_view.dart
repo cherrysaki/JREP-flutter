@@ -30,6 +30,7 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
 
   bool _hasAutoNavigated = false;
   bool _alertShown = false;
+  bool _dialogOpen = false;
   bool _monitorActive = false;
 
   // 最大作業時間（秒）90分
@@ -67,6 +68,10 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
         _hasAutoNavigated = true;
         _timer?.cancel();
         _timer = null;
+        // 集中度低下ダイアログが開いていれば閉じてから遷移する
+        if (_dialogOpen) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
         _goToAfterWorkSurvey();
       }
     });
@@ -116,27 +121,40 @@ class _DisplayRecordViewState extends State<DisplayRecordView> {
     }
   }
 
-  // 集中度低下アラート（音 + ダイアログ）
+  // 集中度低下アラート（音 + ダイアログ）。休憩に進むかどうかは本人が選ぶ
   Future<void> _showFocusAlert() async {
     // アラート音を再生（iOSシステム音1005相当）
     unawaited(_audioPlayer.play(AssetSource('sounds/alert.wav')));
 
-    await showDialog<void>(
+    _dialogOpen = true;
+    final takeBreak = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: const Text('集中度が低下しています。\n休憩を取ってください。'),
+        title: const Text('集中度が低下しています'),
+        content: const Text('少し休憩しませんか？\n休憩に進むと作業後アンケートに移ります。'),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              _goToAfterWorkSurvey();
-            },
-            child: const Text('OK'),
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('作業を続ける'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('休憩する'),
           ),
         ],
       ),
     );
+    _dialogOpen = false;
+    if (!mounted || _hasAutoNavigated) return;
+
+    if (takeBreak == true) {
+      _goToAfterWorkSurvey();
+    } else {
+      // 作業継続：次に集中度が下がったら再びアラートを出す
+      _alertShown = false;
+      _vm.resetAlert();
+    }
   }
 
   Future<void> _confirmEnd() async {
